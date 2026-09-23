@@ -37,7 +37,7 @@
       },
       "browser": {
         "title": "Sign in to Audi",
-        "description": "{notes}Open this link and sign in with your myAudi account:\n\n[Sign in to Audi]({authorize_url})\n\nAfter you approve access, Audi sends your browser to an address starting `myaudi:///` that no desktop browser can open. What you see depends on the browser:\n\n- **Firefox** shows an error page with the `myaudi:///` address in the address bar. Copy it.\n- **Chrome / Edge** just stop on the sign-in page, as if frozen. Press **F12**, open the **Console** tab, and find the line *Failed to launch 'myaudi:///?code=...'* -- copy the address from it.\n- **A phone with the myAudi app installed** will hand the address to the app instead. Use a desktop browser.\n\nPaste the whole `myaudi:///` address below. If it stops working, open the link again -- codes expire quickly.",
+        "description": "{notes}Open this link and sign in with your myAudi account:\\n\\n[Sign in to Audi]({authorize_url})\\n\\nAfter you approve access, Audi sends your browser to an address starting `myaudi:///` that no desktop browser can open. Where to find it:\\n\\n- **Chrome / Edge**: the sign-in page just stops. Press **F12** \\u2192 **Console** and copy the line beginning *Failed to launch 'myaudi:///...* \\u2014 the whole line is fine.\\n- **Firefox**: press **F12** \\u2192 **Network** \\u2192 tick *Persist Logs* before signing in. Afterwards, filter for `success`, open that row, and under *Response Headers* copy the **location** value.\\n- **A phone with the myAudi app installed** hands the address to the app. Use a desktop browser.\\n\\nPaste it below and submit within a couple of minutes \\u2014 the code expires quickly. If it has, open the link again.",
         "data": {
           "redirect_url": "Address your browser was redirected to",
           "refresh_token": "Refresh token (advanced, optional)"
@@ -53,7 +53,7 @@
       },
       "reauth_browser": {
         "title": "Re-authenticate with Audi",
-        "description": "Your Audi authorisation has expired.\n\n{notes}Open this link and sign in with your myAudi account:\n\n[Sign in to Audi]({authorize_url})\n\nAfter you approve access, Audi sends your browser to an address starting `myaudi:///` that no desktop browser can open. What you see depends on the browser:\n\n- **Firefox** shows an error page with the `myaudi:///` address in the address bar. Copy it.\n- **Chrome / Edge** just stop on the sign-in page, as if frozen. Press **F12**, open the **Console** tab, and find the line *Failed to launch 'myaudi:///?code=...'* -- copy the address from it.\n- **A phone with the myAudi app installed** will hand the address to the app instead. Use a desktop browser.\n\nPaste the whole `myaudi:///` address below. If it stops working, open the link again -- codes expire quickly.",
+        "description": "Your Audi authorisation has expired.\\n\\n{notes}Open this link and sign in with your myAudi account:\\n\\n[Sign in to Audi]({authorize_url})\\n\\nAfter you approve access, Audi sends your browser to an address starting `myaudi:///` that no desktop browser can open. Where to find it:\\n\\n- **Chrome / Edge**: the sign-in page just stops. Press **F12** \\u2192 **Console** and copy the line beginning *Failed to launch 'myaudi:///...* \\u2014 the whole line is fine.\\n- **Firefox**: press **F12** \\u2192 **Network** \\u2192 tick *Persist Logs* before signing in. Afterwards, filter for `success`, open that row, and under *Response Headers* copy the **location** value.\\n- **A phone with the myAudi app installed** hands the address to the app. Use a desktop browser.\\n\\nPaste it below and submit within a couple of minutes \\u2014 the code expires quickly. If it has, open the link again.",
         "data": {
           "redirect_url": "Address your browser was redirected to",
           "refresh_token": "Refresh token (advanced, optional)"
@@ -269,4 +269,4 @@
       }
     }
   }
-}
+}\n

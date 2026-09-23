@@ -232,6 +232,11 @@ IDK_DEVICE_AUTHORIZATION_ENDPOINT = (
     "https://identity.vwgroup.io/oidc/v1/device_authorization"
 )
 
+# The redirect as it appears inside a browser's console line, e.g. Chrome's
+# "Failed to launch 'myaudi:///?code=...' because the scheme does not have a
+# registered handler." People paste the whole line; cut the address out of it.
+_REDIRECT_IN_TEXT = re.compile(r"(myaudi:///[^\s'\"<>]*)")
+
 # Client id the myAudi Android app uses. The market configuration used to
 # publish this as "idkClientIDAndroidLive"; it no longer carries any client id
 # key at all, so this literal is now the only source.
@@ -2191,12 +2196,16 @@ class AudiService:
         """Pull the OAuth parameters out of the redirect the user pasted back.
 
         Accepts the whole ``myaudi:///?code=...`` address, an ``https`` address
-        carrying the same parameters, a fragment-style response, or a bare
-        authorization code.
+        carrying the same parameters, a fragment-style response, a bare
+        authorization code, or a browser console line with the address
+        embedded in it.
         """
         value = (redirect_url or "").strip().strip("\"'")
         if not value:
             raise AudiAuthError("No sign-in URL was supplied")
+        found = _REDIRECT_IN_TEXT.search(value)
+        if found:
+            value = found.group(1)
         parsed = urlparse(value)
         params: dict[str, str] = {}
         for part in (parsed.query, parsed.fragment):

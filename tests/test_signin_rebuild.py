@@ -149,6 +149,31 @@ def test_redirect_parsing_accepts_what_users_actually_paste(pasted):
     assert parsed["code"] == "THECODE"
 
 
+CHROME_LINE = (
+    "authenticate?relayState=abc:1 Failed to launch "
+    "'myaudi:///?state=S&code=THECODE' because the scheme does not have a registered handler."
+)
+
+
+def test_whole_chrome_console_line_is_accepted():
+    """People paste the entire console line; the code must come out clean,
+    without the trailing prose glued onto it."""
+    parsed = AudiService.parse_authorization_response(CHROME_LINE)
+    assert parsed["code"] == "THECODE"
+    assert parsed["state"] == "S"
+
+
+def test_state_before_code_is_fine():
+    assert AudiService.parse_authorization_response("myaudi:///?state=S&code=THECODE")["code"] == "THECODE"
+
+
+def test_consent_success_page_is_recognised_as_not_the_code():
+    """Firefox names the request it stopped on -- Audi's consent page -- which
+    carries no code. That must read as 'no code', not as a bogus code."""
+    url = "https://identity.vwgroup.io/oidc/v1/oauth/client/callback/success?user_id=u&client_id=c&relayState=r&hmac=h"
+    assert "code" not in AudiService.parse_authorization_response(url)
+
+
 def test_bare_code_is_accepted():
     assert AudiService.parse_authorization_response("THECODE")["code"] == "THECODE"
 
