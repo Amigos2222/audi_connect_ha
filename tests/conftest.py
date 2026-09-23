@@ -2,10 +2,11 @@
 
 Two obstacles: ``custom_components.audiconnect.__init__`` pulls in Home
 Assistant's helpers on import, and ``const`` needs ``homeassistant.const``.
-Neither has anything to do with the authentication code under test, so the
-package is registered without executing its ``__init__``, and a minimal
-``homeassistant.const`` is supplied only when the real one is absent. If Home
-Assistant is installed, the real module is used untouched.
+Neither has anything to do with the authentication code under test, so when
+Home Assistant is NOT installed the package is registered without executing
+its ``__init__`` and a minimal ``homeassistant.const`` is supplied. When Home
+Assistant IS installed -- upstream's CI, a developer's machine -- none of this
+runs and the package imports exactly as upstream's tests expect.
 """
 
 from __future__ import annotations
@@ -21,10 +22,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-def _ensure_homeassistant_const() -> None:
-    if importlib.util.find_spec("homeassistant") is not None:
-        return
-
+def _stub_homeassistant_const() -> None:
     ha = sys.modules.setdefault("homeassistant", types.ModuleType("homeassistant"))
     ha.__path__ = []  # mark as a package so submodule imports resolve
 
@@ -71,5 +69,6 @@ def _register_package_without_init() -> None:
     parent.audiconnect = package
 
 
-_ensure_homeassistant_const()
-_register_package_without_init()
+if importlib.util.find_spec("homeassistant") is None:
+    _stub_homeassistant_const()
+    _register_package_without_init()
