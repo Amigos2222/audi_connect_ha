@@ -1,5 +1,34 @@
 # Audi Connect (Home Assistant) — sign-in rebuild
 
+> ## ⚠️ Status (late September 2026): the token exchange is walled off by attestation
+>
+> This fork got browser sign-in working right up to the final step — and that
+> step is now blocked for **every** server-side client, not just this one.
+> Audi refuses to exchange a valid authorization code for a token:
+>
+> - `identity.vwgroup.io/oidc/v1/token` → *"missing client_secret"* — the app
+>   client is now treated as confidential.
+> - `emea.bff.cariad.digital/.../token` → *"invalid assertion headers"* —
+>   Google **Play Integrity attestation**, provable only by the genuine signed
+>   myAudi app on a certified device.
+>
+> No pure-Python/Node integration can satisfy this off-device. Discovery, the
+> device-code fallback and the browser login all still work here; the exchange
+> does not, and cannot be fixed in this repository.
+>
+> ### Use a maintained integration that works for Audi EU
+>
+> **[its-me-prash/vwgroup-connect-ha](https://github.com/its-me-prash/vwgroup-connect-ha)**
+> (in the HACS default store) uses a passwordless / device-code channel that
+> still works for Audi EU, with two-way control and full data. It is by the
+> developer who documented the attestation change upstream. That is the
+> recommended path today.
+>
+> This fork is kept as a reference for the IDK device-code + browser PKCE flow,
+> and in case Audi re-opens the app client to public grants.
+
+---
+
 A fork of [audiconnect/audi_connect_ha](https://github.com/audiconnect/audi_connect_ha)
 (rebased onto v2.5.0, so it carries the charging-profile and climate features of that release) that replaces the broken sign-in.
 
