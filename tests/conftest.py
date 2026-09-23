@@ -32,12 +32,23 @@ def _ensure_homeassistant_const() -> None:
     const.CONF_USERNAME = "username"
     const.CONF_PASSWORD = "password"
 
-    class Platform(enum.StrEnum):
-        BINARY_SENSOR = "binary_sensor"
-        SENSOR = "sensor"
-        DEVICE_TRACKER = "device_tracker"
-        LOCK = "lock"
-        SWITCH = "switch"
+    # Home Assistant's full Platform enum, so const.py loads whichever
+    # platforms the integration grows.
+    Platform = enum.StrEnum(
+        "Platform",
+        {
+            name.upper(): name
+            for name in (
+                "air_quality", "alarm_control_panel", "binary_sensor", "button",
+                "calendar", "camera", "climate", "cover", "date", "datetime",
+                "device_tracker", "event", "fan", "geo_location", "humidifier",
+                "image", "lawn_mower", "light", "lock", "media_player", "notify",
+                "number", "remote", "scene", "select", "sensor", "siren", "stt",
+                "switch", "text", "time", "todo", "tts", "update", "vacuum",
+                "valve", "wake_word", "water_heater", "weather",
+            )
+        },
+    )
 
     const.Platform = Platform
     sys.modules["homeassistant.const"] = const

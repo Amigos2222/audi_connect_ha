@@ -2450,4 +2450,10 @@ class AudiService:
         return sha512(b).hexdigest().upper()
 
 
-__all__ = ["AudiAuthError", "AudiService", "AudiTokenRefreshError"]
+__all__ = [
+    "AudiAuthError",
+    "AudiDeviceGrantUnavailable",
+    "AudiService",
+    "AudiTokenRefreshError",
+    "TokenRequestRejected",
+]
