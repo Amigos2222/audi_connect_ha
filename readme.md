@@ -1,3 +1,133 @@
+# Audi Connect (Home Assistant) — sign-in rebuild
+
+A fork of [audiconnect/audi_connect_ha](https://github.com/audiconnect/audi_connect_ha)
+(rebased onto v2.5.0, so it carries the charging-profile and climate features of that release) that replaces the broken sign-in.
+
+Addresses [#846](https://github.com/audiconnect/audi_connect_ha/issues/846)
+("Could not start device sign-in with Audi"), the expiry half of
+[#845](https://github.com/audiconnect/audi_connect_ha/issues/845), and the
+fallback [#842](https://github.com/audiconnect/audi_connect_ha/issues/842) asked
+for.
+
+Only sign-in differs; the original README follows below and describes everything else.
+
+## What was broken
+
+Every European and Canadian account signs in with the OAuth Device
+Authorization Grant. That grant no longer works. The device authorization
+endpoint now answers:
+
+```
+POST https://identity.vwgroup.io/oidc/v1/device_authorization
+  client_id=09b6cbec-cd19-4589-82fd-363dfa8c24da@apps_vw-dilab_com
+
+HTTP 403
+{"error":"unauthorized_client",
+ "error_description":"client is not allowed to use the device_code grant"}
+```
+
+Audi withdrew the `device_code` grant from the myAudi client. Two things make it
+hit everyone at once:
+
+* The market configuration no longer publishes **any** client id. The key
+  `idkClientIDAndroidLive` is gone from every version of
+  `content.app.my.audi.com/service/mobileapp/configurations/market/...` — so
+  every install falls back to the one hard-coded client, the one that has just
+  been refused.
+* The BFF `openid-configuration` no longer advertises a
+  `device_authorization_endpoint` either, while still listing
+  `urn:ietf:params:oauth:grant-type:device_code` under `grant_types_supported`.
+  Discovery therefore looks healthy and the code falls through to the endpoint
+  that returns 403.
+
+Upstream turned any failure there into `async_abort(reason="device_auth_failed")`,
+which is the bare "Could not start device sign-in with Audi. Please try again
+later." — no error text, no way forward, and setup stops dead.
+
+## What this fork does instead
+
+**Browser sign-in (authorization code + PKCE).** The one grant Audi still allows
+this client. Verified against the live service: the authorization URL this fork
+builds is served a real myAudi login page (HTTP 200).
+
+You open a link, sign in on Audi's own page, and approve access. Audi then
+redirects to `myaudi:///?code=...`. No desktop browser can open that scheme, so
+it shows "page cannot be opened" and leaves the address in the address bar —
+you copy that address back into Home Assistant, and the integration exchanges
+the code for tokens.
+
+Because the sign-in happens on Audi's own pages, two-factor prompts, captchas,
+consent screens and any future redesign of the login pages all keep working
+without the integration scripting them. That is the main reason this is better
+than the old password login, which screen-scraped the login form.
+
+Specifically:
+
+| | |
+|---|---|
+| **Device grant still tried first** | One request. If Audi restores it, you get the nicer code flow automatically; the refusal is recognised (`AudiDeviceGrantUnavailable`) and hands over to browser sign-in silently. |
+| **Two token endpoints** | Discovery points at the CARIAD BFF proxy, which is where Play Integrity attestation is enforced — it is why the old password login died with "invalid assertion headers". A fresh code exchange asks the issuer (`identity.vwgroup.io/oidc/v1/token`) first and falls back to the proxy. Refreshes keep the proxy first, since that is what working installs already use. |
+| **Real errors** | Nothing aborts with a bare reason any more. Whatever Audi actually said is shown on the form, and the flow stays open so you can retry. |
+| **Device code expiry (#845)** | The code is minted when the form renders and re-minted once `expires_in` has passed, instead of once when the flow was created. A reauth dialog opened a day later no longer shows a code that is already dead. |
+| **Refresh-token import** | An optional field takes an existing IDK refresh token, for moving an account to another Home Assistant without signing in again. |
+
+Nothing outside sign-in changed. Existing entries with a working refresh token
+keep running and are never pushed through a new sign-in.
+
+## Installing
+
+**HACS (recommended):** HACS → ⋮ → *Custom repositories* → add
+`https://github.com/Amigos2222/audi_connect_ha` with category *Integration*
+→ download it → restart Home Assistant. If the upstream Audi Connect is
+already installed through HACS, remove that repository first (HACS → Audi
+Connect → ⋮ → *Remove*); your configured entry is kept and offers
+re-authentication after the restart.
+
+**Manual:** copy `custom_components/audiconnect` into your `config/` directory
+over the existing folder and restart.
+
+## Signing in
+
+1. Add the integration and pick your region.
+2. Open the **Sign in to Audi** link and sign in with your myAudi account.
+3. Your browser will fail to open an address starting with `myaudi:///`. That is
+   expected.
+4. Copy that whole address from the address bar and paste it into the form.
+
+If the address bar is cleared before you can copy it, look for the `myaudi:///`
+entry in your browser history, or open the link in a private window.
+
+## Tests
+
+```
+pip install pytest beautifulsoup4 aiohttp
+python3 -m pytest tests/ -q
+```
+
+`tests/conftest.py` registers the integration package without executing its
+Home Assistant imports, so the tests run without installing Home Assistant.
+`tests/test_signin_rebuild.py` covers the grant refusal, redirect parsing, the
+PKCE challenge, the endpoint fallback and the error reporting.
+
+## Known limits
+
+* The final code-for-token exchange is the one step that cannot be exercised
+  without a real myAudi account, so it is covered by tests against recorded
+  responses rather than against the live service. Everything before it —
+  discovery, the grant refusal, the authorization URL and the login page it
+  serves — is verified live.
+* If Audi extends attestation to the authorization-code exchange as well, or
+  switches on the Auth0 provider described in
+  [#842](https://github.com/audiconnect/audi_connect_ha/issues/842), browser
+  sign-in will need revisiting. The refresh-token import is the escape hatch in
+  that case.
+* Pasting a URL is clumsier than the device code was. It is what the one
+  remaining grant allows.
+
+---
+
+# Original README
+
 # Audi Connect Integration for Home Assistant
 
 [![GitHub Activity][commits-shield]][commits]

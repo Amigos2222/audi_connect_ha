@@ -207,11 +207,66 @@ REQUEST_FAILED = "request_failed"
 # other scopes cover account identity and the CARIAD BFF vehicle data.
 DEVICE_CODE_SCOPE = "openid mbb profile badge cars dealers vin"
 
+# Scope for the browser (authorization-code) sign-in. The myAudi app asks for
+# the full profile set here; "mbb" is what keeps the legacy fs-car endpoints
+# (lock/unlock, trip statistics, climater) reachable, exactly as above.
+BROWSER_LOGIN_SCOPE = (
+    "address profile badge birthdate birthplace nationalIdentifier nationality "
+    "profession email vin phone nickname name picture mbb gallery openid"
+)
+
+# Redirect the myAudi client is registered for. It is a private-use URI scheme,
+# so a desktop browser cannot follow it and simply shows "page cannot be
+# opened" with the URL still in the address bar -- that URL carries the
+# authorization code, and the user copies it back into Home Assistant.
+BROWSER_REDIRECT_URI = "myaudi:///"
+
+# IdentityKit's own endpoints. Discovery advertises the CARIAD BFF proxy
+# (emea.bff.cariad.digital) as the token endpoint, and that proxy is where Play
+# Integrity attestation is enforced -- it is why the scripted password login
+# fails in Europe with "invalid assertion headers". The issuer's own endpoint
+# serves the same tokens for a public PKCE client, so the code exchange tries
+# it first and falls back to whatever discovery advertised.
+IDK_TOKEN_ENDPOINT = "https://identity.vwgroup.io/oidc/v1/token"
+IDK_DEVICE_AUTHORIZATION_ENDPOINT = (
+    "https://identity.vwgroup.io/oidc/v1/device_authorization"
+)
+
+# Client id the myAudi Android app uses. The market configuration used to
+# publish this as "idkClientIDAndroidLive"; it no longer carries any client id
+# key at all, so this literal is now the only source.
+DEFAULT_CLIENT_ID = "09b6cbec-cd19-4589-82fd-363dfa8c24da@apps_vw-dilab_com"
+
 _LOGGER = logging.getLogger(__name__)
 
 
 class AudiAuthError(Exception):
     """Raised when authorization is missing or a token has been rejected."""
+
+
+class TokenRequestRejected(AudiAuthError):
+    """Every token endpoint refused a token request.
+
+    Carries each attempt as ``(endpoint, parsed_body_or_None, raw_text)`` so a
+    caller can classify the failure -- the refresh path needs to tell a dead
+    refresh token (re-authenticate) from a transient blip (retry).
+    """
+
+    def __init__(self, message: str, attempts: list[tuple[str, dict | None, str]]) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+
+
+class AudiDeviceGrantUnavailable(AudiAuthError):
+    """Raised when the identity provider refuses the device_code grant.
+
+    Audi withdrew the device_code grant from the myAudi client: the device
+    authorization endpoint answers HTTP 403 with ``unauthorized_client`` /
+    "client is not allowed to use the device_code grant". That is what broke
+    sign-in for every European and Canadian account. The config flow catches
+    this specific failure and falls back to browser sign-in rather than
+    reporting a dead end.
+    """
 
 
 class AudiTokenRefreshError(Exception):
@@ -267,7 +322,12 @@ class AudiService:
         self.xclientId = None
         self._tokenEndpoint = ""
         self._authorizationEndpoint = ""
+        self._deviceAuthorizationEndpoint = ""
         self._bearer_token_json = None
+        # PKCE state for the browser sign-in, kept between building the
+        # authorization URL and exchanging the code the user pastes back.
+        self._pkce_verifier: str | None = None
+        self._auth_state: str | None = None
         self._client_id = ""
         self._authorizationServerBaseURLLive = ""
         self._api_level = api_level
@@ -1695,9 +1755,19 @@ class AudiService:
         marketcfg_json = await self._api.request("GET", marketcfg_url, None)
 
         # use dynamic config from marketcfg
-        self._client_id = "09b6cbec-cd19-4589-82fd-363dfa8c24da@apps_vw-dilab_com"
+        # As of the 4.31/5.x configurations Audi no longer publishes any client
+        # id key here (idkClientIDAndroidLive and friends are all gone), so in
+        # practice every account now runs on the literal below. The lookup is
+        # kept in case the key returns.
+        self._client_id = DEFAULT_CLIENT_ID
         if "idkClientIDAndroidLive" in marketcfg_json:
             self._client_id = marketcfg_json["idkClientIDAndroidLive"]
+        else:
+            _LOGGER.debug(
+                "Market config for %s publishes no client id; using the built-in "
+                "myAudi client",
+                self._country,
+            )
 
         self._authorizationServerBaseURLLive = self.__get_cariad_url("/login/v1/audi")
 
@@ -1725,15 +1795,89 @@ class AudiService:
         if "authorization_endpoint" in openidcfg_json:
             self._authorizationEndpoint = openidcfg_json["authorization_endpoint"]
 
-        # Device Authorization Grant (RFC 8628) endpoint. Discovery advertises it;
-        # fall back to the well-known global identity endpoint.
-        self._deviceAuthorizationEndpoint = (
-            "https://identity.vwgroup.io/oidc/v1/device_authorization"
-        )
+        # Device Authorization Grant (RFC 8628) endpoint. Discovery no longer
+        # advertises one (the BFF openid-configuration dropped the key while
+        # still listing the device_code grant as supported), so this normally
+        # falls back to the issuer's well-known endpoint.
+        self._deviceAuthorizationEndpoint = IDK_DEVICE_AUTHORIZATION_ENDPOINT
         if "device_authorization_endpoint" in openidcfg_json:
             self._deviceAuthorizationEndpoint = openidcfg_json[
                 "device_authorization_endpoint"
             ]
+
+    def _token_endpoints(self, prefer_issuer: bool) -> list[str]:
+        """Token endpoints to try for a code/refresh exchange, in order.
+
+        Discovery points at the CARIAD BFF proxy, and that proxy is the
+        component enforcing Play Integrity attestation -- so a fresh
+        authorization-code exchange asks the issuer first (``prefer_issuer``).
+        A refresh keeps the discovered endpoint first, because that is the one
+        every working installation already refreshes against. Both mint tokens
+        for the same issuer, so either is equally good for the AZS and mbboauth
+        exchanges that follow, and whichever is tried second acts as a fallback.
+        """
+        discovered = [self._tokenEndpoint] if self._tokenEndpoint else []
+        ordered = (
+            [IDK_TOKEN_ENDPOINT] + discovered
+            if prefer_issuer
+            else discovered + [IDK_TOKEN_ENDPOINT]
+        )
+        seen: list[str] = []
+        for endpoint in ordered:
+            if endpoint and endpoint not in seen:
+                seen.append(endpoint)
+        return seen
+
+    async def _post_token_request(
+        self, data: dict[str, str], prefer_issuer: bool = True
+    ) -> dict[str, Any]:
+        """POST a token request, trying each endpoint until one issues a token.
+
+        Returns the parsed token response. Raises AudiAuthError carrying the
+        provider's own error code when every endpoint refuses -- the generic
+        "login failed" that used to come out of here told nobody anything.
+        """
+        headers = {
+            "Accept": "application/json",
+            "Accept-Charset": "utf-8",
+            "X-App-Version": AudiAPI.HDR_XAPP_VERSION,
+            "X-App-Name": "myAudi",
+            "User-Agent": AudiAPI.HDR_USER_AGENT,
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        encoded = urlencode(data, encoding="utf-8").replace("+", "%20")
+        endpoints = self._token_endpoints(prefer_issuer)
+        failures: list[str] = []
+        attempts: list[tuple[str, dict | None, str]] = []
+        for endpoint in endpoints:
+            _rsp, rsptxt = await self._api.request(
+                "POST",
+                endpoint,
+                encoded,
+                headers=headers,
+                allow_redirects=False,
+                rsp_wtxt=True,
+            )
+            try:
+                result = json.loads(rsptxt)
+            except json.JSONDecodeError:
+                failures.append(f"{endpoint}: non-JSON response {rsptxt[:120]!r}")
+                attempts.append((endpoint, None, rsptxt))
+                continue
+            if "access_token" in result:
+                if endpoint != endpoints[0]:
+                    _LOGGER.debug("Token issued by fallback endpoint %s", endpoint)
+                return result
+            attempts.append((endpoint, result, rsptxt))
+            failures.append(
+                "{}: {}".format(
+                    endpoint,
+                    result.get("error_description")
+                    or result.get("error")
+                    or rsptxt[:120],
+                )
+            )
+        raise TokenRequestRejected("Token request rejected -- " + "; ".join(failures), attempts)
 
     async def login(self, user: str, password: str) -> None:
         """Username/password login (authorization-code flow).
@@ -1941,13 +2085,24 @@ class AudiService:
             allow_redirects=False,
             rsp_wtxt=True,
         )
-        result = json.loads(rsptxt)
-        if "device_code" not in result:
-            raise Exception(
-                "Device authorization request failed: "
-                + str(result.get("error", rsptxt[:200]))
-            )
-        return result
+        try:
+            result = json.loads(rsptxt)
+        except json.JSONDecodeError:
+            raise AudiAuthError(
+                "Device authorization endpoint returned a non-JSON response: "
+                + rsptxt[:200]
+            ) from None
+        if "device_code" in result:
+            return result
+
+        error = result.get("error")
+        detail = result.get("error_description") or error or rsptxt[:200]
+        if error in ("unauthorized_client", "invalid_client"):
+            # Audi has taken the device_code grant away from this client. No
+            # retry and no other endpoint will help; the caller needs to sign
+            # in through the browser instead.
+            raise AudiDeviceGrantUnavailable(str(detail))
+        raise AudiAuthError("Device authorization request failed: " + str(detail))
 
     async def poll_device_token(self, device_code: str) -> str:
         """Poll the token endpoint once for a device_code grant.
@@ -1994,6 +2149,107 @@ class AudiService:
         _LOGGER.debug("Unexpected device token response: %s", rsptxt[:200])
         return "error"
 
+    async def build_authorization_url(self) -> str:
+        """Start a browser sign-in and return the URL for the user to open.
+
+        Uses the ordinary authorization-code flow with PKCE -- the same flow the
+        app itself uses, and the one grant Audi still allows this client. The
+        user signs in on Audi's own page, which means two-factor prompts,
+        captchas and consent screens all work without us scripting them.
+        """
+        await self._discover_endpoints()
+        self._pkce_verifier = (
+            base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+        )
+        challenge = (
+            base64.urlsafe_b64encode(
+                sha256(self._pkce_verifier.encode("ascii")).digest()
+            )
+            .decode("ascii")
+            .rstrip("=")
+        )
+        self._auth_state = str(uuid.uuid4())
+        params = {
+            "response_type": "code",
+            "client_id": self._client_id,
+            "redirect_uri": BROWSER_REDIRECT_URI,
+            "scope": BROWSER_LOGIN_SCOPE,
+            "state": self._auth_state,
+            "nonce": str(uuid.uuid4()),
+            "prompt": "login",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+        return self._authorizationEndpoint + "?" + urlencode(params)
+
+    def has_pending_authorization(self) -> bool:
+        """True while a browser sign-in is waiting for its code to be pasted."""
+        return self._pkce_verifier is not None
+
+    @staticmethod
+    def parse_authorization_response(redirect_url: str) -> dict[str, str]:
+        """Pull the OAuth parameters out of the redirect the user pasted back.
+
+        Accepts the whole ``myaudi:///?code=...`` address, an ``https`` address
+        carrying the same parameters, a fragment-style response, or a bare
+        authorization code.
+        """
+        value = (redirect_url or "").strip().strip("\"'")
+        if not value:
+            raise AudiAuthError("No sign-in URL was supplied")
+        parsed = urlparse(value)
+        params: dict[str, str] = {}
+        for part in (parsed.query, parsed.fragment):
+            if part:
+                for key, values in parse_qs(part).items():
+                    if values:
+                        params[key] = values[0]
+        if not params and "?" not in value and "&" not in value:
+            # The browser may show only the code, or the user copied just it.
+            params["code"] = value
+        return params
+
+    async def complete_browser_login(self, redirect_url: str) -> None:
+        """Exchange the pasted redirect for a token set and open the session."""
+        if self._pkce_verifier is None:
+            raise AudiAuthError(
+                "This sign-in attempt has expired. Request a new sign-in link."
+            )
+        params = self.parse_authorization_response(redirect_url)
+        if "error" in params:
+            raise AudiAuthError(
+                "Audi rejected the sign-in: "
+                + (params.get("error_description") or params["error"])
+            )
+        code = params.get("code")
+        if not code:
+            raise AudiAuthError(
+                "That address carries no authorization code. Copy the full "
+                "address the browser was redirected to, the one starting with "
+                "myaudi:///"
+            )
+        state = params.get("state")
+        if state and self._auth_state and state != self._auth_state:
+            raise AudiAuthError(
+                "The response belongs to a different sign-in attempt. Start again."
+            )
+        if not self._client_id or not self._tokenEndpoint:
+            await self._discover_endpoints()
+        result = await self._post_token_request(
+            {
+                "grant_type": "authorization_code",
+                "client_id": self._client_id,
+                "code": code,
+                "redirect_uri": BROWSER_REDIRECT_URI,
+                "code_verifier": self._pkce_verifier,
+            }
+        )
+        # One code is good for one exchange; drop the verifier either way.
+        self._pkce_verifier = None
+        self._auth_state = None
+        self._bearer_token_json = result
+        await self._finalize_session()
+
     async def login_with_refresh_token(self, refresh_token: str) -> str:
         """Obtain a session from a stored IDK refresh token.
 
@@ -2001,30 +2257,27 @@ class AudiService:
         attestation. Returns the (possibly rotated) refresh token to persist.
         """
         await self._discover_endpoints()
-        headers = {
-            "Accept": "application/json",
-            "Accept-Charset": "utf-8",
-            "User-Agent": AudiAPI.HDR_USER_AGENT,
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        data = {
-            "client_id": self._client_id,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "response_type": "token id_token",
-        }
-        encoded = urlencode(data, encoding="utf-8").replace("+", "%20")
-        _rsp, rsptxt = await self._api.request(
-            "POST",
-            self._tokenEndpoint,
-            encoded,
-            headers=headers,
-            allow_redirects=False,
-            rsp_wtxt=True,
-        )
-        result = json.loads(rsptxt)
-        if "access_token" not in result:
-            _raise_refresh_rejected("Token refresh rejected", result, rsptxt)
+        try:
+            result = await self._post_token_request(
+                {
+                    "client_id": self._client_id,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                    "response_type": "token id_token",
+                },
+                prefer_issuer=False,
+            )
+        except TokenRequestRejected as err:
+            # Keep 2.5.0's rule: only invalid_grant means the refresh token is
+            # dead and re-authentication is needed; anything else is a retry.
+            # If any endpoint said invalid_grant that is authoritative;
+            # otherwise report the discovered endpoint's answer, the one every
+            # working installation refreshes against.
+            chosen = next(
+                (a for a in err.attempts if (a[1] or {}).get("error") in _REFRESH_REAUTH_ERRORS),
+                err.attempts[0] if err.attempts else ("", None, str(err)),
+            )
+            _raise_refresh_rejected("Token refresh rejected", chosen[1] or {}, chosen[2])
         self._bearer_token_json = result
         await self._finalize_session()
         return self._bearer_token_json.get("refresh_token", refresh_token)

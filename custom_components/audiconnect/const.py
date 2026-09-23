@@ -38,6 +38,9 @@ CONF_REGION = "region"
 CONF_FILTER_VINS = "filter_vins"
 CONF_REFRESH_AFTER_ACTION = "refresh_vehicle_data_after_action"
 CONF_REFRESH_TOKEN = "refresh_token"
+# Where the browser ended up after signing in: the myaudi:///?code=... address
+# the user copies out of the address bar. Flow input only; never stored.
+CONF_REDIRECT_URL = "redirect_url"
 CONF_UPDATE_SLEEP = "update_sleep"
 
 REFRESH_VEHICLE_DATA_FAILED_EVENT = "refresh_failed"
@@ -121,6 +124,7 @@ __all__ = [
     "CONF_DURATION",
     "CONF_FILTER_VINS",
     "CONF_PASSWORD",
+    "CONF_REDIRECT_URL",
     "CONF_REFRESH_AFTER_ACTION",
     "CONF_REFRESH_TOKEN",
     "CONF_REGION",

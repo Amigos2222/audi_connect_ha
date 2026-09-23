@@ -110,6 +110,29 @@ class AudiConnectAccount:
             self._sync_refresh_token()
         return status
 
+    async def build_authorization_url(self) -> str:
+        """Start a browser sign-in and return the URL for the user to open."""
+        return await self._audi_service.build_authorization_url()
+
+    def has_pending_authorization(self) -> bool:
+        """True while a browser sign-in is waiting for its code to be pasted."""
+        return self._audi_service.has_pending_authorization()
+
+    async def complete_browser_login(self, redirect_url: str) -> None:
+        """Finish a browser sign-in from the redirect the user pasted back."""
+        await self._audi_service.complete_browser_login(redirect_url)
+        self._loggedin = True
+        self._logintime = time.time()
+        self._sync_refresh_token()
+
+    async def login_with_refresh_token(self, refresh_token: str) -> None:
+        """Adopt an existing IDK refresh token and open a session with it."""
+        rotated = await self._audi_service.login_with_refresh_token(refresh_token)
+        self._refresh_token = rotated or refresh_token
+        self._loggedin = True
+        self._logintime = time.time()
+        self._sync_refresh_token()
+
     @property
     def vehicles(self) -> list[AudiConnectVehicle]:
         """Return the list of discovered vehicles."""

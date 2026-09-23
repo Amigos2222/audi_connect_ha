@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from time import monotonic
 from typing import Any
 
 import voluptuous as vol
@@ -24,12 +25,13 @@ from homeassistant.helpers.selector import (
 )
 
 from .audi_connect_account import AudiConnectAccount
-from .audi_services import AudiAuthError
+from .audi_services import AudiAuthError, AudiDeviceGrantUnavailable
 from .const import (
     API_LEVELS,
     CONF_API_LEVEL,
     CONF_FILTER_VINS,
     CONF_PASSWORD,
+    CONF_REDIRECT_URL,
     CONF_REFRESH_AFTER_ACTION,
     CONF_REFRESH_TOKEN,
     CONF_REGION,
@@ -63,7 +65,18 @@ class AudiConfigFlow(ConfigFlow, domain=DOMAIN):
         self._device_code: str | None = None
         self._verification_uri: str | None = None
         self._user_code: str | None = None
+        self._device_code_expires_at: float | None = None
+        self._authorize_url: str | None = None
+        self._device_grant_note: str | None = None
+        self._auth_error_detail: str | None = None
         self._reauth_entry: ConfigEntry | None = None
+
+    def _device_code_expired(self) -> bool:
+        """True once the device code we are holding has timed out."""
+        return (
+            self._device_code_expires_at is not None
+            and monotonic() >= self._device_code_expires_at
+        )
 
     def _build_connection(
         self, username: str | None = None, password: str | None = None
@@ -197,38 +210,70 @@ class AudiConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_device(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Device Authorization Grant: show a code/URL, then poll for approval."""
+        """Device Authorization Grant, with browser sign-in as the fallback.
+
+        Audi has withdrawn the device_code grant from the myAudi client -- the
+        device authorization endpoint answers 403 ``unauthorized_client`` -- so
+        in practice this hands straight over to async_step_browser. It is still
+        attempted first: the device flow is the better experience, and one
+        request is all it costs to find out whether Audi has restored it.
+        """
         errors: dict[str, str] = {}
 
         if self._connection is None:
             self._connection = self._build_connection()
 
-        if self._device_code is None:
+        # Mint the code when the form is rendered, and re-mint once it has
+        # expired. A code lives for expires_in seconds (300), while a reauth
+        # dialog can sit unopened for days; minting it once when the flow was
+        # created left users looking at a code that was already dead, and the
+        # verification link then answered INVALID_REQUEST (issue #845).
+        if self._device_code is None or self._device_code_expired():
             try:
                 response = await self._connection.request_device_code()
-            except Exception:
+            except AudiDeviceGrantUnavailable as err:
+                _LOGGER.info(
+                    "Audi refused the device-code grant for this client (%s); "
+                    "falling back to browser sign-in",
+                    err,
+                )
+                self._device_grant_note = str(err)
+                return await self.async_step_browser()
+            except Exception as err:  # noqa: BLE001 - surfaced to the user
+                # Anything else (network, unexpected payload) is reported on the
+                # browser form rather than aborting the flow with a message that
+                # says nothing, which is what used to happen here (issue #846).
                 _LOGGER.exception("Audi device authorization request failed")
-                return self.async_abort(reason="device_auth_failed")
+                self._device_grant_note = str(err) or type(err).__name__
+                return await self.async_step_browser()
             self._device_code = response["device_code"]
             self._verification_uri = response.get(
                 "verification_uri_complete"
             ) or response.get("verification_uri")
             self._user_code = response.get("user_code")
+            expires_in = response.get("expires_in")
+            try:
+                self._device_code_expires_at = (
+                    monotonic() + float(expires_in) if expires_in else None
+                )
+            except (TypeError, ValueError):
+                self._device_code_expires_at = None
 
         if user_input is not None:
             try:
                 status = await self._connection.poll_device_token(self._device_code)
-            except Exception:
+            except Exception:  # noqa: BLE001 - surfaced as a form error
                 _LOGGER.exception("Audi device token poll failed")
                 status = None
                 errors["base"] = "device_auth_failed"
             if status == "ok":
-                return await self._finish_device_login()
+                return await self._finish_token_login()
             if status in ("authorization_pending", "slow_down"):
                 errors["base"] = "authorization_pending"
             elif status == "expired":
                 # Code timed out; mint a fresh one and show it again.
                 self._device_code = None
+                self._device_code_expires_at = None
                 return await self.async_step_device()
             elif status is not None:
                 errors["base"] = "device_auth_failed"
@@ -244,12 +289,101 @@ class AudiConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=errors,
         )
 
-    async def _finish_device_login(self) -> ConfigFlowResult:
+    async def async_step_browser(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Sign in through the browser (authorization code + PKCE).
+
+        The user signs in on Audi's own page, so two-factor prompts, captchas,
+        consent screens and any future change to the login pages all keep
+        working without the integration scripting them. Audi then redirects to
+        ``myaudi:///?code=...``; no desktop browser can open that scheme, so the
+        address simply stays in the address bar and the user copies it back
+        here. A stored refresh token can be pasted instead, which is how an
+        account moves to another Home Assistant without signing in again.
+        """
+        errors: dict[str, str] = {}
+        self._auth_error_detail = None
+
+        if self._connection is None:
+            self._connection = self._build_connection()
+
+        if user_input is not None:
+            redirect_url = (user_input.get(CONF_REDIRECT_URL) or "").strip()
+            token = (user_input.get(CONF_REFRESH_TOKEN) or "").strip()
+            try:
+                if redirect_url:
+                    await self._connection.complete_browser_login(redirect_url)
+                    return await self._finish_token_login()
+                if token:
+                    await self._connection.login_with_refresh_token(token)
+                    return await self._finish_token_login()
+                errors["base"] = "browser_input_missing"
+            except AudiAuthError as err:
+                _LOGGER.debug("Audi browser sign-in failed: %s", err)
+                self._auth_error_detail = str(err)
+                errors["base"] = "browser_auth_failed"
+            except Exception as err:  # noqa: BLE001 - surfaced as a form error
+                _LOGGER.exception("Audi browser sign-in failed")
+                self._auth_error_detail = str(err) or type(err).__name__
+                errors["base"] = "browser_auth_failed"
+
+            if errors and not self._connection.has_pending_authorization():
+                # The authorization code was spent by the failed exchange, so
+                # the link on the form is dead. Mint a fresh one for the retry.
+                self._authorize_url = None
+
+        if self._authorize_url is None:
+            try:
+                self._authorize_url = await self._connection.build_authorization_url()
+            except Exception as err:  # noqa: BLE001 - reported in the abort
+                _LOGGER.exception("Could not build the Audi sign-in URL")
+                return self.async_abort(
+                    reason="cannot_connect",
+                    description_placeholders={
+                        "error_detail": str(err) or type(err).__name__
+                    },
+                )
+
+        notes = ""
+        if self._device_grant_note:
+            notes += (
+                "_Audi is not issuing device codes for this client right now "
+                f"({self._device_grant_note}), so Home Assistant is signing you "
+                "in through your browser instead._\n\n"
+            )
+        if self._auth_error_detail:
+            notes += f"**Last attempt failed:** {self._auth_error_detail}\n\n"
+
+        step_id = "reauth_browser" if self._reauth_entry is not None else "browser"
+        return self.async_show_form(
+            step_id=step_id,
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(CONF_REDIRECT_URL, default=""): str,
+                    vol.Optional(CONF_REFRESH_TOKEN, default=""): str,
+                }
+            ),
+            description_placeholders={
+                "authorize_url": self._authorize_url or "",
+                "notes": notes,
+            },
+            errors=errors,
+        )
+
+    async def async_step_reauth_browser(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Reauth form id for the browser path (see async_step_browser)."""
+        return await self.async_step_browser(user_input)
+
+    async def _finish_token_login(self) -> ConfigFlowResult:
+        """Persist an entry from a completed device-code or browser sign-in."""
         assert self._connection is not None
         refresh_token = self._connection.refresh_token
         if not refresh_token:
-            # Approved but no refresh token issued; do not persist a dead entry.
-            return self.async_abort(reason="device_auth_failed")
+            # Signed in but no refresh token issued; do not persist a dead entry.
+            return self.async_abort(reason="no_refresh_token")
 
         if self._reauth_entry is not None:
             # Schedule the reload ourselves (see _finish_password_login). A
